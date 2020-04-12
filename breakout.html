@@ -1,0 +1,836 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8" />
+    <title>Gamedev Canvas Workshop</title>
+    <style>
+    	* {
+            padding: 0;
+            margin: 0;
+        }
+    	canvas {
+            background: #ccc;
+            display: block;
+            margin: 0 auto;
+        }
+    </style>
+</head>
+<body>
+
+<canvas id="myCanvas" width="480" height="320"></canvas>
+<script type="text/javascript" src="tones.js"></script>
+<script>
+
+    class bounceTone {
+        constructor() {
+            this.f = this.fmin = tones.getFrequency('c4');
+            this.fmax = tones.getFrequency('c7');
+            this.p = 1/12;
+        }
+
+        step() {
+            tones.play(this.f);
+
+            // step by one note (no major/minor awareness)
+            this.f = this.f * Math.pow(2, this.p);
+
+            // flip around at upper/lower bounds (remain audible)
+            if (this.f > this.fmax) {
+                this.f = this.fmax;
+                this.p *= -1;
+            }
+            else if (this.f < this.fmin) {
+                this.f = this.fmin;
+                this.p *= -1;
+            }
+        }
+
+        static parseNote(note, sep) {
+            let val = undefined;
+
+            let i = note.indexOf(sep);
+            if (i > 0) {
+                // take valid number
+                let v = Number.parseInt(note.substr(i+1, note.length-1));
+                if (!Number.isNaN(v)) {
+                    val = v;
+                }
+
+                // trim delay spec from note
+                note = note.substr(0,i);
+
+                // console.log(`note ${note} delay ${d}`);
+            }
+            
+            return [note, val];
+        }
+
+        static playSequence(notes) {
+            let note = notes[0];
+            let delay, attack, release;
+
+            // note[/a][,r][:d]
+
+            [note, delay] = bounceTone.parseNote(note, ':');
+            [note, release] = bounceTone.parseNote(note, ',');
+            [note, attack] = bounceTone.parseNote(note, '/');
+
+            // default quarter note delay
+            if (!delay) {
+                delay = 250;
+            }
+
+            // console.log(`note ${note} delay ${d}`);
+
+            // play first
+            tones.play(note, attack, release);
+
+            // recursively play the remaining note sequence with the given interval delay
+            if (notes.length > 1) {
+                setTimeout(bounceTone.playSequence,
+                    delay,
+                    notes.slice(1));
+            }
+        }
+
+        reset(level = 1) {
+            this.f = this.fmin = tones.getFrequency('c', 4);
+            if (level > 1) {
+                // step bottom of range up by half octave per level
+                this.f = this.f * Math.pow(2, (level - 1)*(1/2));
+                this.fmin = this.f;
+            }
+        }
+    }
+
+    // reflect back the additional travel a vector took when colliding through a surface
+    //  ca -    collision surface (a axis)
+    //  a -     object location with full travel on collision axis (through surface c)
+    //  da -    object speed on collision axis whih put it in current location
+    //
+    //         |
+    //  >>>>>>>|.*
+    //         |
+    //         |
+    // ==>
+    //         |
+    //       *.|<<
+    //         |
+    //         |
+    //
+    // return - corrected value of a
+    function reflectVector(ca, a) {
+        let ra = ca - a;
+        return a + 2*ra;
+    }
+
+    class gameAsset {
+        constructor(name, ctx) {
+            this.name = name;
+            this.ctx = ctx;
+        }
+    }
+
+    class gameBall extends gameAsset {
+        constructor(ctx, x, y, radius, color, dx, dy) {
+            super("ball", ctx);
+
+            this.x = x;
+            this.y = y;
+            this.radius = radius;
+            this.color = color;
+            this.dx = dx;
+            this.dy = dy;
+
+            this.maxdy = 6;
+            this.maxdx = 6;
+            this.mindx = 1;
+
+            // full save
+            this.sx = x;
+            this.sy = y;
+            this.sdx = dx;
+            this.sdy = dy;
+
+            // level save
+            this.ldx = dx;
+            this.ldy = dy;
+        }
+
+        reset(full = true) {
+            this.x = this.sx;
+            this.y = this.sy;
+            if (full) {
+                // console.log(`reset full sdx ${this.sdx} ldy ${this.sdy}`)
+                this.dx = this.ldx = this.sdx;
+                this.dy = this.ldy = this.sdy;
+
+                this.maxdy = 6;
+                this.maxdx = 6;
+                this.mindx = 1;
+            } else {
+                // console.log(`reset level ldx ${this.ldx} ldy ${this.ldy}`)
+                this.dx = this.ldx;
+                this.dy = this.ldy;
+            }
+        }
+
+        rescale(pct) {
+            // console.log(`rescale ${pct} base ldx ${this.ldx} ldy ${this.ldy}`)
+
+            // current level rescale
+            // push starting velocity up
+            let p = pct + 1;
+            this.ldx *= p;
+            this.ldy *= p;
+
+            // but only kick max up half as fast
+            p = pct/2 + 1;
+
+            this.maxdx *= p;
+            this.maxdy *= p;
+            this.mindx *= p;
+
+            // sanity guard for future higher levels
+            // should probably have an absolute cap?
+            if (this.ldx > this.maxdx) {
+                this.ldx = this.maxdx;
+            }
+            if (this.ldy > this.maxdy) {
+                this.ldy = this.maxdy;
+            }
+        }
+
+        draw() {
+            this.ctx.beginPath();
+            this.ctx.arc(this.x, this.y, this.radius + 1, 0, Math.PI*2);
+            this.ctx.fillStyle = this.color;
+            this.ctx.fill();
+            this.ctx.closePath();
+        }
+
+        move() {
+            let bounce = false;
+            let hitPaddle = false;
+            let hitPaddleOutside = false;
+
+            // side walls
+            if (this.x + this.dx > canvas.width - this.radius || this.x + this.dx < this.radius) {
+                bounce = true;
+                this.dx = -this.dx;
+            }
+
+            // top wall
+            else if (this.y + this.dy < this.radius) {
+                bounce = true;
+                this.dy = -this.dy;
+            }
+
+            // bottom wall / paddle
+            // start detection at the upper paddle boundary
+            else if (this.y + this.dy > canvas.height - paddle.h - this.radius) {
+                console.log(`check coll: ball @ ${this.x},${this.y} : paddle @ ${paddle.x}<->${paddle.x + paddle.w} + ${canvas.height - paddle.h}`);
+
+                // paddle?
+                if (this.x > paddle.x && this.x < paddle.x + paddle.w) {
+                    console.log('HIT paddle');
+
+                    hitPaddle = bounce = true;
+                    if (this.x < paddle.x + 0.4*paddle.w ||
+                        this.x > paddle.x + 0.6*paddle.w) {
+                        hitPaddleOutside = true;
+                    }
+                }
+                
+                // miss only when the ball finishes travel to the bottom
+                else if (this.y + this.dy >= canvas.height - this.radius) {
+                    console.log('MISS paddle');
+
+                    // reset the brick hit tone sequence
+                    brickTone.reset(level);
+                    return false;
+                }
+            }
+
+            // do travel
+            this.x += this.dx;
+            this.y += this.dy;
+
+            // process hit
+            if (hitPaddle) {
+
+                // hit - reset the tone
+                brickTone.reset(level);
+
+                // reflect back the additional travel through the top of the paddle
+                // collision is at ball radius and paddle height
+                this.y = reflectVector(canvas.height - paddle.h, this.y + this.radius) - this.radius;
+
+                // bounce vector
+                this.dy = -this.dy;
+
+                let ddy = 0;
+                let ddx = 0;
+
+                // accelerate (+dx/dy) and bend (add'l +dx) to outside hits
+                // reduce bend (-dx) on inside hits
+                if (hitPaddleOutside) {
+                    tones.play('c5');
+                    ddx = 0.5 * Math.sign(this.dx);     // accel, in direction of travel
+                    ddy = 0.25;
+                } else {
+                    tones.play('g4');
+                    ddx = -0.25 * Math.sign(this.dx);   // slow, in direction of travel
+                }
+
+                this.dy -= ddy;
+                this.dx += ddx * Math.sign(this.dx);
+
+                // max dy (note this is post-bounce, so always negative)
+                // note dy never decreases
+                // bound dx
+                this.dy = Math.max(this.dy, -this.maxdy);
+                this.dx = Math.max(Math.min(Math.abs(this.dx), this.maxdx), this.mindx) * Math.sign(this.dx);
+
+                // console.log(`outside? ${hitPaddleOutside} dx ${this.dx} dy ${this.dy}`)
+            }
+
+            return true;
+        }
+    }
+
+    class gamePaddle extends gameAsset {
+        constructor(ctx, dx, w, h) {
+            super("paddle", ctx);
+
+            this.x = dx + (canvas.width-w)/2;
+            this.w = w;
+            this.h = h;
+
+            this.sx = this.x;
+            this.sw = this.w
+        }
+
+        rescale(pct) {
+            let p = 1 + pct;
+
+            this.w *= p;
+            this.sx = (canvas.width-this.w)/2;
+        }
+
+        draw() {
+            this.ctx.beginPath();
+            this.ctx.rect(this.x, canvas.height-this.h, this.w, this.h);
+            this.ctx.fillStyle = "#0095DD";
+            this.ctx.fill();
+            this.ctx.closePath();
+        }
+
+        reset(full = true) {
+            this.x = this.sx;
+            if (full) {
+                this.w = this.sw;
+            }
+        }
+
+        move() {
+            if (rightPressed) {
+                this.x += 7;
+                if (this.x + this.w > canvas.width){
+                    this.x = canvas.width - this.w;
+                }
+            }
+            else if (leftPressed) {
+                this.x -= 7;
+                if (this.x < 0){
+                    this.x = 0;
+                }
+            } else {
+                // consume mouse movement
+                let mx = mouseX;
+                mouseX = undefined;
+
+                if (mx != undefined) {
+                    paddle.x = mx;
+                }
+            }
+        }
+    }
+
+    // brick color by row
+    let brickSpectrum = [
+        ["#6600cc","#4d0099"],
+        ["#cc6600","#994d00"],
+        ["#00cc66","#00994d"],
+        ["#0033cc","#002699"],
+        ["#910836","#610524"]
+    ];
+
+    class gameBricks extends gameAsset {
+        constructor(ctx, rows, cols, height, padding, offsetTop, offsetLeft) {
+            super("bricks", ctx);
+
+            this.rows = rows;
+            this.cols = cols;
+            this.height = height;
+            this.padding = padding;
+            this.offsetTop = offsetTop;
+            this.offsetLeft = offsetLeft;
+
+            this.reset(rows, cols);
+        }
+
+        draw() {
+            for (let c = 0; c < this.cols; c++) {
+                for (let r = 0; r < this.rows; r++) {
+                    let b = this.bricks[c][r];
+                    if (b.status) {
+                        ctx.beginPath();
+                        ctx.rect(b.x, b.y, this.width, this.height);
+                        ctx.fillStyle = brickSpectrum[r][0];
+                        ctx.fill();
+                        ctx.closePath();
+
+                        if (b.hits > 1) {
+                            let shieldWidth = (b.hits - 1) * 3;
+                            ctx.lineWidth = shieldWidth;
+                            ctx.lineJoin = 'bevel';
+                            ctx.strokeStyle = brickSpectrum[r][1];
+                            ctx.strokeRect(b.x, b.y, this.width, this.height);
+                        }
+                    }
+                }
+            }
+        }
+
+        reset(rows, cols) {
+            this.rows = rows;
+            this.cols = cols;
+
+            // autofit columns to canvas
+            this.width = ((canvas.width - 2*this.offsetLeft)/this.cols) - this.padding;
+
+            this.num = 0;
+            this.bricks = [];
+
+            for (let c = 0; c < this.cols; c++) {
+                this.bricks[c] = [];
+                for (let r = 0; r < this.rows; r++) {
+                    let bx = (c*(this.width+this.padding))+this.offsetLeft;
+                    let by = (r*(this.height+this.padding))+this.offsetTop;
+
+                    this.num += 1;
+                    this.bricks[c][r] = {
+                        x: bx,
+                        y: by,
+                        hits: level,
+                        status: 1
+                    };
+                }
+            }
+        }
+
+        bounds() {
+
+            let bound = {
+                minx: Number.MAX_SAFE_INTEGER,
+                miny: Number.MAX_SAFE_INTEGER,
+                maxx: Number.MIN_SAFE_INTEGER,
+                maxy: Number.MIN_SAFE_INTEGER
+            }
+
+            for (let c = 0; c < this.cols; c++) {
+                for (let r = 0; r < this.rows; r++) {
+                    let b = this.bricks[c][r];
+
+                    if (b.status) {
+                        let bx = (c*(this.width+this.padding))+this.offsetLeft;
+                        let by = (r*(this.height+this.padding))+this.offsetTop;
+
+                        bound.minx = Math.min(bound.minx, bx);
+                        bound.miny = Math.min(bound.miny, by);
+
+                        bx += this.width;
+                        by += this.height;
+
+                        bound.maxx = Math.max(bound.maxx, bx);
+                        bound.maxy = Math.max(bound.maxy, by);
+                    }
+                }
+            }
+
+            return bound;
+
+        }
+
+        collision() {
+            let recheck;
+
+            do {
+                recheck = false;
+
+                for (let c = 0; !recheck && c < this.cols; c++) {
+                    for (let r = 0; !recheck && r < this.rows; r++) {
+                        let b = this.bricks[c][r];
+                        if (b.status &&
+                            ball.x >= b.x &&
+                            ball.x <= b.x + this.width &&
+                            ball.y >= b.y &&
+                            ball.y <= b.y + this.height) {
+
+                            // xxx assumes collision with the upper and lower edges
+                            // xxx should add dection of side collisions
+
+                            b.hits -= 1;
+
+                            if (!b.hits) {
+
+                                // erase, reduce brick count and increment score
+                                b.status = 0;
+                                this.num -= 1;
+                                totalScore += 1;
+                            }
+
+                            // process hit/bounce unless this is the last brick for this level
+                            // (avoid "jerk" bounce on last brick)
+                            if (this.num) {
+
+                                // fix up the residual bounce by reflecting the excess travel the
+                                // ball took "into" the brick (top or bottom)
+                                ball.y = reflectVector((ball.dy < 0 ? b.y + this.height : b.y), ball.y);
+
+                                // recheck collisions since we moved the ball (fast ball!)
+                                recheck = true;
+
+                                // don't chirp on the last brick either ... interferes with
+                                // end music!
+                                brickTone.step();
+
+                                // ... and reflect the travel vector
+                                ball.dy = -ball.dy;
+                            }
+                        }
+                    }
+                }
+            } while (recheck);
+        }
+    }
+
+    class gameHeader extends gameAsset {
+        constructor(ctx) {
+            super("header", ctx);
+
+            this.score = false;
+            this.level = false;
+            this.lives = false;
+        }
+
+        draw() {
+            let n = "#0095DD";     // default light blue
+            let h = "#ff0066";     // brick red
+            let font = "16px Arial";
+
+            this.ctx.fillStyle = this.score ? h:n;
+            this.ctx.font = (this.score ? "700 ":"") + "16px Arial";
+            this.ctx.fillText("Score: "+totalScore, 8, 20);
+
+            this.ctx.fillStyle = this.ctx.fillStyle = this.lives ? h:n;
+            this.ctx.font = (this.lives ? "700 ":"") + "16px Arial";
+            this.ctx.fillText("Lives: "+lives, canvas.width-65, 20);
+
+            this.ctx.fillStyle = this.level ? h : n;
+            this.ctx.font = (this.level ? "700 ":"") + "16px Arial";
+            let levelText = "Level "+level;
+            let m = this.ctx.measureText(levelText);
+            this.ctx.fillText(levelText, (canvas.width - m.width)/2, 20);
+
+            this.score = this.level = this.lives = false;
+        }
+    }
+
+    var canvas = document.getElementById("myCanvas");
+    var ctx = canvas.getContext("2d");
+
+    let ball = new gameBall(ctx, canvas.width/2, canvas.height-30, 9, "#000000", 2, -2);
+    let paddle = new gamePaddle(ctx, 0, 75, 10);
+    let bricks = new gameBricks(ctx, 3, 5, 20, 10, 30, 30);
+    let header = new gameHeader(ctx);
+    let brickTone = new bounceTone();
+
+    var rightPressed = false;
+    var leftPressed = false;
+    var mouseX = undefined;
+
+    var totalScore = 0;
+    var lives = 3;
+
+    var level = 1;
+    var levelMax = 3;
+
+    let gameDone = false;
+    let gameFreeze = false;
+    let gameInput = true;
+    let gameMsg = [];
+
+    let attractMode = true;
+
+    const musicOde = ['e','e','f','g','g','f','e','d','c','c','d','e','e,125:375','d:125','d,200:500',
+                 'e','e','f','g','g','f','e','d','c','c','d','e','d,125:375','c:125','c,200:500',
+                 'd','d','e','c','d','e,50:125','f,50:125','e','c','d','e,50:125','f,50:125','e','d','c','d','g3,200:500',
+                 'e','e','f','g','g','f','e','d','c','c','d','e','d,125:375','c:125','c,200:500'];
+    const musicLevelRiff = ['c5','d5','e5','g5,50:125','c6','g5','c6,200:500'];
+    const musicMiss = ['e','c','gb3','gb3,200'];
+    const musicGameOver = ['e5','ab,200','e','db,700'];
+
+    function drawMessage(msgs) {
+        ctx.font = "20px Arial";
+        ctx.fillStyle = "#0095DD";
+
+        // center in canvas no less than two text rows below the bounding box of the current live brick layout
+        let bounds = bricks.bounds();
+
+        let m = ctx.measureText(msgs[0]);
+        let ascent = m.actualBoundingBoxAscent;
+        let h = Math.max(bounds.maxy + 3*ascent, canvas.height/2);
+
+        for (let i = 0; i < msgs.length; i++) {
+            // already have the first since we needed it to determine y height
+            if (i) {
+                m = ctx.measureText(msgs[i]);
+            }
+            ctx.fillText(msgs[i],
+                     (canvas.width - m.width)/2,
+                     h);
+            // console.log(`msg ${msgs[i]} at h ${h}`);
+            h += ascent + 10;
+        }
+    }
+
+    function randomColor() {
+        return `rgb(
+            ${Math.round(Math.random() * 255)},
+            ${Math.round(Math.random() * 255)},
+            ${Math.round(Math.random() * 255)})`
+    }
+
+    function keyDownHandler(e) {
+        // input frozen?
+        if (!gameInput) {
+            return;
+        }
+
+        // force single input to true - missed up events?
+        if (e.key == "Right" || e.key == "ArrowRight") {
+            rightPressed = true;
+            leftPressed = false;
+        }
+        else if (e.key == "Left" || e.key == "ArrowLeft") {
+            rightPressed = false;
+            leftPressed = true;
+        }
+    }
+
+    function keyUpHandler(e) {
+        // input frozen?
+        if (!gameInput) {
+            return;
+        }
+        
+        if (e.key == "Right" || e.key == "ArrowRight") {
+            rightPressed = false;
+        }
+        else if (e.key == "Left" || e.key == "ArrowLeft") {
+            leftPressed = false;
+        }
+        else {
+            if (e.key == " ") {
+                if (gameFreeze) {
+                    resumeGame();
+                }
+            }
+        }
+    }
+
+    function mouseMoveHandler(e) {
+        // input frozen?
+        if (!gameInput) {
+            return;
+        }
+
+        let relativeX = e.clientX - canvas.offsetLeft;
+        let halfPaddle = paddle.w/2;
+
+        // note paddle x is the actual paddle box
+        // mouse position tracks the middle of the paddle box
+        if (relativeX < halfPaddle) {
+            mouseX = 0;
+        } else if (relativeX > canvas.width - halfPaddle) {
+            mouseX = canvas.width - paddle.w;
+        } else {
+            mouseX = relativeX - halfPaddle;
+        }
+    }
+
+    function mouseUpHandler(e) {
+        // input frozen?
+        if (!gameInput) {
+            return;
+        }
+        
+        if (gameFreeze) {
+            resumeGame();
+        }
+    }
+
+    function resetInput() {
+        rightPressed = false;
+        leftPressed = false;
+    }
+
+    function resumeGame() {
+        gameFreeze = false;
+        gameInput = true;
+
+        // complete game over mode
+        if (gameDone) {
+
+            lives = 3;
+            level = 1;
+            totalScore = 0;
+
+            ball.reset();
+            paddle.reset();
+            brickTone.reset();
+            resetInput();
+            
+            bricks.reset(3, 5);
+
+            gameDone = false;
+        }
+
+        // complete attract mode
+        else if (attractMode) {
+
+            attractMode = false;
+        }
+
+        // resume from life lost
+        else if (bricks.num) {
+
+            ball.reset(false);
+            paddle.reset(false);
+            brickTone.reset(level);
+            resetInput();
+        }
+        
+        // next level
+        else {
+
+            level += 1;
+            paddle.rescale(-0.25);
+            ball.rescale(0.20);
+
+            ball.reset(false);
+            paddle.reset(false);
+            brickTone.reset(level);
+            resetInput();
+
+            bricks.reset(3 + (level-1), 5 + (level-1));
+        }
+
+        requestAnimationFrame(draw);
+    }
+
+    function draw() {
+
+        // drawing code
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+        bricks.draw()
+        ball.draw();
+        paddle.draw();
+        header.draw();
+
+        if (attractMode) {
+            gameMsg = ["PLAY BREAKOUT"];
+        }
+
+        if (gameMsg.length) {
+
+            drawMessage(gameMsg);
+            gameMsg = [];
+            gameFreeze = true;
+
+        } else {
+
+            // run current collisions
+            bricks.collision();
+
+            // board empty?
+            if (!bricks.num) {
+
+                if (level === levelMax) {
+                    bounceTone.playSequence(musicOde);
+
+                    gameMsg = ["YOU WIN, CONGRATULATIONS!"];
+                    gameDone = true;
+                }
+                else {
+                    bounceTone.playSequence(musicLevelRiff);
+
+                    // build message ... even levels add a life
+                    gameMsg = [`LEVEL ${level} COMPLETE`];
+                    if (!(level % 2)) {
+                        lives += 1;
+                        header.lives = true;
+                        gameMsg.push('EXTRA LIFE');
+                    }
+
+                    gameInput = false;
+                    setTimeout(() => resumeGame(), 3000);
+                }
+            }
+
+            // move ball, did it miss?
+            else if (!ball.move()) {
+
+                lives -= 1;
+                if (lives) {
+                    // console.log(`miss at dx ${ball.dx} dy ${ball.dy}`)
+                    bounceTone.playSequence(musicMiss);
+
+                    gameMsg = ["MISS"];
+                    gameInput = false;
+                    setTimeout(() => resumeGame(), 2500);
+
+                } else {
+                    bounceTone.playSequence(musicGameOver);
+
+                    gameMsg = ["GAME OVER"];
+                    gameDone = true;
+                }
+            }
+            
+            // process paddle and continue
+            else {
+
+                paddle.move();
+            }
+        }
+
+        if (!gameFreeze) {
+            requestAnimationFrame(draw);
+        }
+    }
+
+    document.addEventListener("keydown", keyDownHandler, false);
+    document.addEventListener("keyup", keyUpHandler, false);
+    document.addEventListener("mousemove", mouseMoveHandler, false);
+    document.addEventListener("mouseup", mouseUpHandler, false);
+
+    requestAnimationFrame(draw);
+
+</script>
+
+</body>
+</html>
